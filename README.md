@@ -1,23 +1,137 @@
 # siemens_aoi
 
-## 프로젝트 목표
+# 실제 불량은 놓치지 않고, 불필요한 수동검사는 줄일 수 있을까?
 
-팀원과 회의 후 구체적 사항 기록 예정
+Siemens PCB AOI 데이터 기반 비용민감형 False Call 감소 PoC
 
-## 참여 방법
+아주대학교 실전 제조 AI 부트캠프 최종 프로젝트 (2026.08) · 팀 소삼기일 (김재학, 석동진, 이승원, 최평화)
 
-이 저장소는 사람과 에이전트가 함께 작업하는 2일간의 머신러닝 미니 프로젝트다. 탐색, 전처리, 학습 및 평가는 우선 노트북에서 수행한다.
+## 무엇을 하는 프로젝트인가
 
-작업을 시작하기 전에 `CONTRIBUTING.md`를 읽는다. 새 파일을 만들 때는 반드시 저장소의 동일 유형 example을 먼저 참고한다.
+PCB 공정의 자동광학검사(AOI) 장비는 정상 납땜을 불량으로 잘못 판정하는 경우(false call)가 많다. 이 때문에 수동 검사와 재작업에 사람 손이 많이 든다.
 
-## GitHub 협업
+이 프로젝트는 AOI를 대체하지 않는다. AOI가 불량으로 의심한 지점을 **한 번 더 판정하는 2차 모델**을 두어, 실제 불량은 놓치지 않으면서 수동검사량을 줄이는 것이 목표다.
 
-- 새 작업은 GitHub Issue로 기록하고 제공된 작업 이슈 양식을 사용한다.
-- 변경사항은 Pull Request로 공유하고 관련 Issue를 연결한다.
-- 팀 공유용 협업 가이드는 `docs/project_status.html`에서 확인한다.
-- 자세한 작성 규칙은 `CONTRIBUTING.md`에서 확인한다.
+```text
+AOI 1차 판정 ──▶ 2차 모델 ──▶ 정상 가능성이 높으면 자동 통과
+                     └──────▶ 불량 의심이면 수동검사 (대시보드에서 판정 보조)
+```
 
-## 환경 설정
+## 데이터
+
+| 항목 | 내용 |
+|---|---|
+| 출처 | Siemens 공장 SMT 라인 AOI 데이터 |
+| 수집 기간 | 132일 |
+| 건수 | 440,274건 (AOI가 불량으로 판정한 지점만 포함) |
+| 실제 불량 | 4,622건 (1.05%) |
+| False call | 435,652건 (98.95%) |
+| 컬럼 | 77개 (익명화). 검사 시각, 검사 유형(0~4), 메타 정보, 물리 측정값 |
+
+원본 데이터는 `data/raw/`에 두며 Git에는 올리지 않는다. 컬럼과 분할 기준은 [`docs/data.md`](docs/data.md)에 정리했다.
+
+## 어려웠던 점
+
+1. **클래스 불균형**: 실제 불량이 전체의 1.05%뿐이다.
+2. **검사 유형마다 컬럼의 의미가 다르다**: 같은 컬럼이라도 유형에 따라 납땜 높이, 오배치 등 가리키는 측정값이 달라 유형별로 모델을 나눴다.
+3. **시간이 지날수록 불량률이 오른다**: 검수자가 바뀌면서 판정 기준이 달라져, 컬럼 값이 같은데 라벨이 다른 행이 생기고 후반부 불량률이 높아졌다.
+
+## 시도와 결과
+
+모든 수치는 학습과 모델 선택에 쓰지 않은 Test 구간 기준이다. FCR(False Call Reduction)은 실제 false call 중 모델이 걸러 내 수동검사를 줄인 비율이다.
+
+### 기준 모델
+
+| 평가 구간 | PR-AUC | Recall | FCR | 놓친 불량(FN) |
+|---|---:|---:|---:|---:|
+| Validation | 0.4497 | 99.16% | 69.94% | 3 |
+| Test | 0.3184 | 89.81% | 60.94% | 237 |
+
+Validation에서는 좋았지만 Test에서 놓친 불량이 크게 늘었다. 시간에 따른 변화에 대응해야 했다.
+
+### 시간 변화 대응
+
+| 모델 | PR-AUC | Recall | FCR | 해석 |
+|---|---:|---:|---:|---|
+| Baseline | 0.318 | 89.8% | 60.9% | FCR은 높지만 미검이 많음 |
+| 선형 시간 가중치 | 0.372 | 90.8% | 49.8% | 순위 성능은 개선, Recall 부족 |
+| 순차 업데이트 | 0.278 | 94.5% | 40.5% | Recall 개선, PR-AUC·FCR 하락 |
+| **Fold 앙상블** | **0.383** | **93.9%** | **52.0%** | Recall과 FCR의 균형이 가장 좋음 |
+| 앙상블 + 선형 가중치 | 0.390 | 93.9% | 43.3% | PR-AUC 상승, FP 증가 |
+| 앙상블 + 지수 가중치 | 0.390 | 94.1% | 47.5% | Recall 소폭 상승, FCR 하락 |
+
+### 클래스 불균형 대응
+
+| 불균형 처리 | PR-AUC | Recall | 놓친 불량(FN) | FCR |
+|---|---:|---:|---:|---:|
+| Baseline | 0.318 | 89.8% | 237 | 60.9% |
+| 클래스 가중치 (√r) | 0.379 | 95.9% | 95 | 21.1% |
+| 클래스 가중치 (√r) + 시간 가중치 | 0.385 | 96.0% | 93 | 19.1% |
+| **클래스 가중치 (r)** | 0.319 | **98.49%** | **35** | 10.05% |
+
+Recall을 높일수록 FCR이 떨어진다. 두 지표만으로는 어느 모델이 나은지 정하기 어려웠다.
+
+## 모델을 어떻게 골랐나
+
+Recall과 FCR을 함께 보되, 두 지표를 **비용 하나로 합쳐** 비교했다.
+
+- 총비용 = 남은 수동검사 건수 × 수동검사 비용 + 놓친 불량 건수 × 미검 비용
+- 실제 비용은 주어지지 않아, 미검 1건 비용이 수동검사 1건 비용의 몇 배인지(r)를 바꿔 가며 계산했다.
+- 모델 없이 전부 수동검사하는 경우의 비용을 기준선으로 함께 놓았다.
+
+| 구분 | 상대 총비용 | 전수검사보다 이득인 범위 |
+|---|---|---|
+| 기존 AOI 전수검사 | 88,052 | (기준선) |
+| 005 Fold 앙상블 | 43,302 + 141r | r이 약 317배 이하일 때 |
+| 007 불량 클래스 가중치 | 79,400 + 35r | r이 약 247배 이하일 때 |
+
+데이터의 불량 대 정상 비율이 약 1:100이므로, 아무 판단 없이 전부 통과시켜도 불량 1건을 놓치는 대신 수동검사 약 100건이 줄어든다. 모델은 이보다 나아야 의미가 있는데, 두 후보 모두 이 기준을 넘는다.
+
+## 결론
+
+한 모델로 확정하지 않고, 운영 목적에 따라 고를 수 있는 두 후보를 제시했다.
+
+| 운영 목적 | 후보 모델 | Recall | 미검률 | FCR | 장점 |
+|---|---|---:|---:|---:|---|
+| 생산성 중심 | 005 Fold 앙상블 | 93.94% | 6.06% | 52.04% | 수동검사 절감에 유리 |
+| 안전 중심 | 007 불량 클래스 가중치 | 98.49% | 1.51% | 10.05% | 불량 미검 방지에 유리 |
+
+- 005: [`docs/experiments/0825_peace_005_type_expert_fold_ensemble.md`](docs/experiments/0825_peace_005_type_expert_fold_ensemble.md)
+- 007: [`docs/experiments/0825_peace_007_type_expert_class_weight.md`](docs/experiments/0825_peace_007_type_expert_class_weight.md)
+- 전체 실험 목록: [`docs/experiments/index.md`](docs/experiments/index.md), 모델별 Test 성능: [`docs/model_val.md`](docs/model_val.md)
+
+## 현장 작업자용 대시보드
+
+수동검사가 필요한 지점을 작업자에게 보여 주고 판정을 돕는 Streamlit 데모다.
+
+- AOI 이미지, 검사 유형, 모델의 정상 판정 확률과 임계값을 표시한다.
+- 모델이 판정에 많이 쓴 상위 피처 값(SHAP 기준)을 함께 보여 줘 판단의 단서를 준다.
+- 작업자의 판정 결과를 기록해 이후 재학습에 쓸 수 있게 한다.
+
+```bash
+pip install -r dashboard/requirements.txt
+streamlit run dashboard/app.py
+```
+
+화면 구성과 데모 범위는 [`dashboard/README.md`](dashboard/README.md)에 있다.
+
+## 한계
+
+- 실제 오검·미검 비용을 알 수 없어 비용 비율을 가정해 비교했다.
+- 시간에 따라 라벨 기준이 달라지는 문제는 완전히 해결하지 못했다. 재학습과 가중치로 일부 대응했다.
+- 안전 중심 모델도 미검률 1.51%로, 처음 목표로 잡은 1% 이하에는 미치지 못했다.
+- 대시보드는 데모이며 판정 기록을 DB에 저장하지 않는다.
+
+## 팀과 역할
+
+| 이름 | 실험 파일 표기 | 주로 한 일 |
+|---|---|---|
+| 김재학 | `kimjaehak` | EDA, 시간 변화·라벨 이동 진단, 임계값과 비용 정책 실험 |
+| 석동진 | `dongjin` | EDA, 불균형 처리와 데이터 증강 실험, SHAP 분석 |
+| 이승원 | `lsw` | 기준 모델과 평가 지표, 시간에 따른 라벨 변화 분석, 비용 기준 제안 |
+| 최평화 | `peace` | 유형별 XGBoost, Fold 앙상블, 클래스 가중치 (최종 후보 모델) |
+
+## 실행 환경
 
 ```bash
 python3.12 -m venv .venv
@@ -28,74 +142,21 @@ jupyter lab
 
 노트북은 저장소 루트에서 Jupyter를 실행한 뒤 사용한다.
 
-## 수동 검사 대시보드
-
-CSV Test 구간을 시간순으로 검토하는 Streamlit 데모는 `dashboard/`에 있다.
-
-```bash
-streamlit run dashboard/app.py
-```
-
-샘플 이미지 이름과 현재 데모 범위는 `dashboard/README.md`에서 확인한다.
-
-## 데이터
-
-원본 데이터는 `data/raw/`에 둔다. 실제 데이터 파일은 Git에서 제외된다.
-
-익명 컬럼과 데이터 구조를 기록할 때는 `docs/data_example.md`를 참고해 실제 데이터용 문서를 작성한다.
-
-## 실험 추가 순서
-
-1. example 노트북과 example 실험 문서를 읽는다.
-2. `MMDD_작성자_실험번호_설명` 규칙으로 노트북을 생성한다.
-3. 같은 stem으로 `docs/experiments/`에 설명 문서를 생성한다.
-4. 노트북을 처음부터 끝까지 실행한다.
-5. 실험 문서와 `docs/experiments/index.md`를 갱신한다.
-6. 모델의 최종 Test 평가가 있으면 `docs/model_val.md`를 갱신한다.
-7. 필요한 경우 같은 stem으로 모델을 `models/`에 저장한다.
-
-세부 규칙은 `CONTRIBUTING.md`에서 확인한다.
-
-## Example
-
-- 노트북 example: `notebooks/0823_example_001_baseline.ipynb`
-- 실험 문서 example: `docs/experiments/0823_example_001_baseline.md`
-- 데이터 설명 example: `docs/data_example.md`
-
-Example은 구조와 작성 형식을 보여주기 위해 합성 데이터를 사용한다. 실제 실험을 시작할 때 example 파일을 복사한 뒤 파일 이름, 데이터 로딩, 실험 내용과 결과를 실제 작업에 맞게 변경한다.
-
 ## 저장소 구조
 
 ```text
 siemens_aoi/
 ├── README.md
-├── CONTRIBUTING.md
-├── AGENTS.md
-├── requirements.txt
-├── .gitignore
-├── .github/
-│   ├── ISSUE_TEMPLATE/
-│   │   └── task.yml
-│   └── pull_request_template.md
-├── data/
-│   └── raw/
-│       └── .gitkeep
-├── dashboard/
-│   ├── app.py
-│   ├── data_source.py
-│   ├── inference.py
-│   ├── config.py
-│   └── assets/
-│       └── sample_images/
+├── CONTRIBUTING.md          # 협업 규칙, 실험 추가 순서
+├── dashboard/               # 수동 검사 대시보드 (Streamlit)
+├── data/raw/                # 원본 데이터 (Git 제외)
 ├── docs/
-│   ├── project_status.html
-│   ├── data_example.md
-│   ├── model_val.md
-│   └── experiments/
-│       ├── index.md
-│       └── 0823_example_001_baseline.md
-├── notebooks/
-│   └── 0823_example_001_baseline.ipynb
+│   ├── data.md              # 데이터 설명
+│   ├── model_val.md         # 모델별 Test 성능 요약
+│   └── experiments/         # 실험별 문서
+├── notebooks/               # 실험 노트북
 └── models/
-    └── .gitkeep
 ```
+
+실험을 추가하는 방법과 파일 이름 규칙은 [`CONTRIBUTING.md`](CONTRIBUTING.md)에 있다.
+
